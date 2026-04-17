@@ -208,6 +208,7 @@ rule-providers:
 rules:
   - "PROCESS-NAME,dota2.exe,🐬 自定义直连"
   - "PROCESS-NAME,HillsLite.exe,🐬 自定义直连"
+  - "PROCESS-NAME,HillsPlayer.exe,🐬 自定义直连"
   - "PROCESS-NAME,steam.exe,🐬 自定义直连"
   - "RULE-SET,customdirect,🐬 自定义直连"
   - "RULE-SET,customproxy,🐳 自定义代理"
