@@ -38,7 +38,9 @@ RULE_SAMPLE = {
 
 def run_js(source, expression):
     program = (
-        "const fs=require('fs'); const vm=require('vm'); const ctx={console};"
+        "const fs=require('fs'); const vm=require('vm');"
+        "const ctx={console:{log:(...a)=>process.stderr.write(a.join(' ')+'\\n'),"
+        "error:(...a)=>process.stderr.write(a.join(' ')+'\\n')}};"
         "vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'), ctx);"
         "Promise.resolve(eval(process.argv[2])).then(value => {"
         "  process.stdout.write(JSON.stringify(value));"
@@ -49,8 +51,9 @@ def run_js(source, expression):
         input=source.encode(),
         capture_output=True,
     )
+    run_js.last_stderr = result.stderr.decode()
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode() or result.stdout.decode())
+        raise RuntimeError(run_js.last_stderr or result.stdout.decode())
     return json.loads(result.stdout.decode() or "null")
 
 
@@ -207,6 +210,55 @@ class ChainConfigTest(unittest.TestCase):
         self.assertIn("Hysteria2", blocked_message)
         self.assertIn("REALITY", blocked_message)
         self.assertNotIn("mock-password", blocked_message)
+
+    def test_composite_emoji_and_metadata_nodes(self):
+        proxies = [
+            node("🏴‍☠️ 落地-ExampleJP", "192.0.2.21", 2101, type="vmess"),
+            node("🏴‍☠️ 自建-ExampleVPS", "192.0.2.22", 2102, type="ss"),
+            node("🏳️‍🌈 花云-Expire: 2027-04-17", "192.0.2.23", 2103, type="trojan"),
+            node("花云-ExpireNode", "192.0.2.24", 2104, type="ss"),
+            node("落地-官网推荐", "192.0.2.25", 2105, type="vmess"),
+            node("🏳️‍🌈 花云-流量: 20GB", "192.0.2.26", 2106, type="ss"),
+            node("自建-官网: example.test", "192.0.2.27", 2107, type="ss"),
+            node("花云-Example-落地-尾", "192.0.2.28", 2108, type="trojan"),
+        ]
+        config = build(self.template, proxies)
+        names = [item["name"] for item in config["proxies"]]
+        self.assertIn("出口·🏴‍☠️ 落地-ExampleJP", names)
+        self.assertIn("入口·🏴‍☠️ 自建-ExampleVPS", names)
+        self.assertIn("入口·花云-ExpireNode", names)
+        self.assertIn("出口·落地-官网推荐", names)
+        self.assertIn("入口·花云-Example-落地-尾", names)
+        self.assertTrue(all("Expire:" not in name for name in names))
+        self.assertTrue(all("流量:" not in name for name in names))
+        self.assertTrue(all("官网:" not in name for name in names))
+        self.assertTrue(all(not name.startswith("出口·花云-") for name in names))
+        self.assertIn("Expire 1", run_js.last_stderr)
+        self.assertIn("流量 1", run_js.last_stderr)
+        self.assertIn("官网 1", run_js.last_stderr)
+        self.assertNotIn("192.0.2", run_js.last_stderr)
+        self.assertNotIn("mock-password", run_js.last_stderr)
+        exits = [item for item in config["proxies"] if item["name"].startswith("出口·")]
+        self.assertTrue(all(item["dialer-proxy"] == "入口选择" for item in exits))
+
+        for bad in (
+            "🏴‍☠️ 🏴‍☠️ 落地-重复装饰",
+            "🏳️‍🌈🏴‍☠️ 花云-重复装饰",
+            "🇺🇸🏴‍☠️ 落地-重复装饰",
+            "通知落地-不是前缀",
+            "🏴‍☠️ 未知-没有来源标签",
+        ):
+            with self.assertRaises(RuntimeError) as rejected:
+                build(
+                    self.template,
+                    [
+                        node("花云-保留入口", "192.0.2.1", 1001, type="ss"),
+                        node("落地-保留出口", "192.0.2.10", 2001, type="vmess"),
+                        node(bad, "192.0.2.30", 3001, type="ss"),
+                    ],
+                )
+            self.assertIn(bad, str(rejected.exception))
+            self.assertNotIn("192.0.2.30", str(rejected.exception))
 
     def test_main_uses_named_sources_and_keeps_the_whole_config(self):
         payload = json.dumps({"template": self.template}, ensure_ascii=False)

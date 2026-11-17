@@ -144,13 +144,34 @@ function splitCollection(list) {
   const entrance = [];
   const exit = [];
   const unknown = [];
+  const skipped = { expire: 0, traffic: 0, site: 0 };
   list.forEach((proxy, index) => {
     const copy = normalizeProxy(proxy, index);
     const role = classifyRole(copy.name);
+    if (!role) {
+      unknown.push(copy.name);
+      return;
+    }
+    const info = infoKind(copy.name);
+    if (info) {
+      skipped[info] += 1;
+      return;
+    }
     if (role === "exit") exit.push(copy);
-    else if (role === "entrance") entrance.push(copy);
-    else unknown.push(copy.name);
+    else entrance.push(copy);
   });
+  const skippedTotal = skipped.expire + skipped.traffic + skipped.site;
+  console.log(
+    "输出阶段跳过机场信息节点 " +
+      skippedTotal +
+      " 个：Expire " +
+      skipped.expire +
+      "，流量 " +
+      skipped.traffic +
+      "，官网 " +
+      skipped.site +
+      "。未修改来源订阅。"
+  );
   if (unknown.length > 0) {
     const shown = unknown.slice(0, 30).map(name => "「" + name + "」").join("、");
     const more = unknown.length > 30 ? "，其余 " + (unknown.length - 30) + " 个未列出" : "";
@@ -159,7 +180,8 @@ function splitCollection(list) {
         shown +
         more +
         "。只承认来源订阅已经加上的「落地-」「花云-」「自建-」「守候网络-」。" +
-        "组合里的国旗或 [IPv6] 可以分别在这个前缀前面或名称末尾。两个国旗、前缀被改掉，或只是名称里出现「落地」，都算无法确定。"
+        "来源标签前面只允许一个装饰：地区旗、海盗旗或彩虹旗；[IPv6] 只能在名称末尾。" +
+        "重复装饰、前缀被改掉，或只是名称中间出现这些字，都算无法确定。"
     );
   }
   if (exit.length === 0) {
@@ -190,25 +212,52 @@ function normalizeProxy(proxy, index) {
 }
 
 function classifyRole(name) {
-  const head = splitLeadingFlag(name);
+  const head = splitLeadingDecoration(name);
   if (head.ambiguous) return "";
   if (head.rest.indexOf(CHAIN.exitToken) === 0) return "exit";
   const entrance = CHAIN.entranceTokens.some(token => head.rest.indexOf(token) === 0);
   return entrance ? "entrance" : "";
 }
 
-function splitLeadingFlag(name) {
+function infoKind(name) {
+  if (/(?:^|[\s\-_|)）])Expire\s*[:：]\s*\d{4}-\d{2}-\d{2}(?!\d)/i.test(name)) return "expire";
+  if (/(?:^|[\s\-_|)）])(?:到期|过期)\s*[:：]\s*\d{4}-\d{2}-\d{2}(?!\d)/.test(name)) return "expire";
+  if (/(?:^|[\s\-_|)）])(?:Traffic|流量|剩余流量)\s*[:：]\s*\d/i.test(name)) return "traffic";
+  if (/(?:^|[\s\-_|)）])官网\s*[:：]\s*\S/.test(name)) return "site";
+  return "";
+}
+
+function splitLeadingDecoration(name) {
   const chars = Array.from(name);
-  if (chars.length < 2 || !isRegional(chars[0]) || !isRegional(chars[1])) {
-    return { rest: name, ambiguous: false };
-  }
-  let index = 2;
-  if (chars[index] === "\uFE0F") index += 1;
+  const first = decorationLength(chars, 0);
+  if (!first) return { rest: name, ambiguous: false };
+  let index = first;
   if (chars[index] === " " || chars[index] === "\u3000") index += 1;
-  if (isRegional(chars[index]) && isRegional(chars[index + 1])) {
-    return { rest: name, ambiguous: true };
-  }
+  if (decorationLength(chars, index)) return { rest: name, ambiguous: true };
   return { rest: chars.slice(index).join(""), ambiguous: false };
+}
+
+function decorationLength(chars, start) {
+  const first = chars[start];
+  const second = chars[start + 1];
+  if (isRegional(first) && isRegional(second)) {
+    return chars[start + 2] === "\uFE0F" ? 3 : 2;
+  }
+  if (codeOf(first) === 0x1f3f4 && second === "\u200D" && codeOf(chars[start + 2]) === 0x2620) {
+    return chars[start + 3] === "\uFE0F" ? 4 : 3;
+  }
+  if (codeOf(first) === 0x1f3f3) {
+    let index = start + 1;
+    if (chars[index] === "\uFE0F") index += 1;
+    if (chars[index] === "\u200D" && codeOf(chars[index + 1]) === 0x1f308) {
+      return index + 2 - start;
+    }
+  }
+  return 0;
+}
+
+function codeOf(char) {
+  return char ? char.codePointAt(0) : 0;
 }
 
 function isRegional(char) {
