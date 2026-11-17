@@ -1,15 +1,16 @@
 // Clash Party 与 FlClash 共用的 Sub-Store 文件脚本。
-// 用法见 chain-mihomo-指南.md。只改下面 CHAIN 里的名称。
+// 用法见 chain-mihomo-指南.md。默认不用改。
 //
-// 这是唯一的集成方式：Sub-Store 的文件类型必须是 mihomo 配置。
-// 保存文件时，Sub-Store 会调用 main(config)，并把返回的完整对象写成 YAML。
-// 脚本自己用 produceArtifact 读取入口和出口，不要再添加「从订阅添加节点」。
+// 集成方式：Sub-Store 只新建一个 mihomo 配置文件，并只添加这一条脚本。
+// 脚本用 produceArtifact 读取已有组合订阅，不修改订阅、组合或它们的处理器。
+// 保存时 Sub-Store 调用 main(config)，返回值必须是完整配置。
 
 var CHAIN = {
-  // type 只能是 "subscription"（单条订阅）或 "collection"（组合订阅）。
-  // name 必须与 Sub-Store 里的名称完全一致。
-  entrance: { type: "subscription", name: "入口" },
-  exit: { type: "subscription", name: "出口" },
+  // 默认就是现有组合订阅。只有名称不同时才改这里。
+  collection: { type: "collection", name: "合并" },
+  // 来源订阅已经写上的前缀。落地- 是既定的出口角色，不是国家或家宽判断。
+  exitToken: "落地-",
+  entranceTokens: ["花云-", "自建-", "守候网络-"],
   entranceGroup: "入口选择",
   exitGroup: "出口选择",
   entranceMark: "入口·",
@@ -76,7 +77,7 @@ var CHAIN_DEFAULT_GROUPS = [
   GROUP.google,
 ];
 
-function buildChainConfig(config, entranceProxies, exitProxies) {
+function buildChainConfig(config, proxies) {
   const next = JSON.parse(JSON.stringify(config || null));
   if (CHAIN.entranceGroup !== GROUP.entrance || CHAIN.exitGroup !== GROUP.exit) {
     throw new Error("脚本内部的入口或出口组名不一致。");
@@ -90,14 +91,13 @@ function buildChainConfig(config, entranceProxies, exitProxies) {
   }
   assertPolicyShape(groups);
 
-  const entrance = normalizeSide(entranceProxies, "入口", CHAIN.entranceMark);
-  const exit = normalizeSide(exitProxies, "出口", CHAIN.exitMark);
-  rejectBlockedExits(exit);
-  rejectSharedEndpoints(entrance, exit);
+  const split = splitCollection(proxies);
+  rejectBlockedExits(split.exit);
+  rejectSharedEndpoints(split.entrance, split.exit);
 
   const used = Object.create(null);
-  const entranceReady = tagSide(entrance, CHAIN.entranceMark, used, null);
-  const exitReady = tagSide(exit, CHAIN.exitMark, used, CHAIN.entranceGroup);
+  const entranceReady = tagSide(split.entrance, CHAIN.entranceMark, used, null);
+  const exitReady = tagSide(split.exit, CHAIN.exitMark, used, CHAIN.entranceGroup);
 
   next.proxies = entranceReady.concat(exitReady);
   fillMembers(groups, CHAIN.entranceGroup, entranceReady.map(item => item.name));
@@ -110,23 +110,9 @@ async function main(config) {
   if (typeof produceArtifact !== "function") {
     throw new Error("这个脚本只能作为 Sub-Store mihomo 配置文件的脚本操作运行。");
   }
-  if (
-    CHAIN.entrance.type === CHAIN.exit.type &&
-    CHAIN.entrance.name === CHAIN.exit.name
-  ) {
-    throw new Error("入口和出口不能填写同一个订阅。请分成两份来源。");
-  }
-  const entrance = await loadRole(CHAIN.entrance, "入口");
-  const exit = await loadRole(CHAIN.exit, "出口");
-  return buildChainConfig(config, entrance, exit);
-}
-
-async function loadRole(spec, role) {
-  if (!spec || !spec.name || !spec.type) {
-    throw new Error("请在脚本顶部填写" + role + "的 type 和 name。");
-  }
-  if (spec.type !== "subscription" && spec.type !== "collection") {
-    throw new Error(role + "的 type 只能是 subscription 或 collection。");
+  const spec = CHAIN.collection;
+  if (!spec || spec.type !== "collection" || !spec.name) {
+    throw new Error("CHAIN.collection 必须是 type 为 collection 的组合订阅。");
   }
   let proxies;
   try {
@@ -139,20 +125,96 @@ async function loadRole(spec, role) {
   } catch (error) {
     const reason = error && error.message ? error.message : String(error);
     throw new Error(
-      "读不到" +
-        role +
-        "「" +
+      "读不到组合订阅「" +
         spec.name +
-        "」（" +
-        spec.type +
-        "）。请把 CHAIN 里的 name 改成 Sub-Store 中完全相同的名字；它如果是组合订阅，把 type 改成 collection。原始错误：" +
+        "」。请确认 Sub-Store 里有这个组合，且脚本顶部的名称完全一致。不要改组合本身。原始错误：" +
         reason
     );
   }
   if (!Array.isArray(proxies) || proxies.length === 0) {
-    throw new Error(role + "「" + spec.name + "」里没有节点。");
+    throw new Error("组合订阅「" + spec.name + "」里没有节点。");
   }
-  return proxies;
+  return buildChainConfig(config, proxies);
+}
+
+function splitCollection(list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    throw new Error("组合订阅里没有节点。");
+  }
+  const entrance = [];
+  const exit = [];
+  const unknown = [];
+  list.forEach((proxy, index) => {
+    const copy = normalizeProxy(proxy, index);
+    const role = classifyRole(copy.name);
+    if (role === "exit") exit.push(copy);
+    else if (role === "entrance") entrance.push(copy);
+    else unknown.push(copy.name);
+  });
+  if (unknown.length > 0) {
+    const shown = unknown.slice(0, 30).map(name => "「" + name + "」").join("、");
+    const more = unknown.length > 30 ? "，其余 " + (unknown.length - 30) + " 个未列出" : "";
+    throw new Error(
+      "有节点认不出来源前缀，已停止生成，不会把它们猜成入口或出口：" +
+        shown +
+        more +
+        "。只承认来源订阅已经加上的「落地-」「花云-」「自建-」「守候网络-」。" +
+        "组合里的国旗或 [IPv6] 可以分别在这个前缀前面或名称末尾。两个国旗、前缀被改掉，或只是名称里出现「落地」，都算无法确定。"
+    );
+  }
+  if (exit.length === 0) {
+    throw new Error("组合里没有带「落地-」前缀的出口节点。空的出口不会改成直连。");
+  }
+  if (entrance.length === 0) {
+    throw new Error("组合里没有花云、自建或守候网络这些入口节点。空的入口不会改成直连。");
+  }
+  return { entrance: entrance, exit: exit };
+}
+
+function normalizeProxy(proxy, index) {
+  if (!proxy || typeof proxy !== "object" || Array.isArray(proxy)) {
+    throw new Error("第 " + (index + 1) + " 个节点不是有效对象。");
+  }
+  if (!proxy.name) throw new Error("第 " + (index + 1) + " 个节点没有名称。");
+  if (!proxy.server || proxy.port === undefined || proxy.port === null || proxy.port === "") {
+    throw new Error("节点「" + proxy.name + "」缺少服务器或端口。");
+  }
+  const copy = {};
+  Object.keys(proxy).forEach(key => {
+    if (key.charAt(0) !== "_") copy[key] = proxy[key];
+  });
+  copy.name = stripMark(String(copy.name));
+  delete copy["dialer-proxy"];
+  delete copy["underlying-proxy"];
+  return copy;
+}
+
+function classifyRole(name) {
+  const head = splitLeadingFlag(name);
+  if (head.ambiguous) return "";
+  if (head.rest.indexOf(CHAIN.exitToken) === 0) return "exit";
+  const entrance = CHAIN.entranceTokens.some(token => head.rest.indexOf(token) === 0);
+  return entrance ? "entrance" : "";
+}
+
+function splitLeadingFlag(name) {
+  const chars = Array.from(name);
+  if (chars.length < 2 || !isRegional(chars[0]) || !isRegional(chars[1])) {
+    return { rest: name, ambiguous: false };
+  }
+  let index = 2;
+  if (chars[index] === "\uFE0F") index += 1;
+  if (chars[index] === " " || chars[index] === "\u3000") index += 1;
+  if (isRegional(chars[index]) && isRegional(chars[index + 1])) {
+    return { rest: name, ambiguous: true };
+  }
+  return { rest: chars.slice(index).join(""), ambiguous: false };
+}
+
+function isRegional(char) {
+  if (!char) return false;
+  const code = char.codePointAt(0);
+  return code >= 0x1f1e6 && code <= 0x1f1ff;
 }
 
 function assertPolicyShape(groups) {
@@ -201,37 +263,12 @@ function assertManualMembers(group, byName) {
   });
 }
 
-function normalizeSide(list, role, mark) {
-  if (!Array.isArray(list) || list.length === 0) {
-    throw new Error(role + "没有节点。请检查对应订阅，或修改脚本顶部的名称。");
-  }
-  return list.map((proxy, index) => {
-    if (!proxy || typeof proxy !== "object" || Array.isArray(proxy)) {
-      throw new Error(role + "第 " + (index + 1) + " 个节点不是有效对象。");
-    }
-    if (!proxy.name) {
-      throw new Error(role + "第 " + (index + 1) + " 个节点没有名称。");
-    }
-    if (!proxy.server || proxy.port === undefined || proxy.port === null || proxy.port === "") {
-      throw new Error("节点「" + proxy.name + "」缺少服务器或端口。");
-    }
-    const copy = {};
-    Object.keys(proxy).forEach(key => {
-      if (key.charAt(0) !== "_") copy[key] = proxy[key];
-    });
-    copy.name = stripMark(String(copy.name), mark);
-    delete copy["dialer-proxy"];
-    delete copy["underlying-proxy"];
-    return copy;
-  });
-}
-
-function stripMark(name, preferred) {
+function stripMark(name) {
   let current = name;
   let removedMark = false;
-  const marks = [CHAIN.entranceMark, CHAIN.exitMark, preferred];
+  const marks = [CHAIN.entranceMark, CHAIN.exitMark];
   for (let round = 0; round < 4; round += 1) {
-    const hit = marks.find(mark => mark && current.indexOf(mark) === 0);
+    const hit = marks.find(mark => current.indexOf(mark) === 0);
     if (!hit) break;
     current = current.slice(hit.length);
     removedMark = true;
@@ -255,9 +292,9 @@ function rejectBlockedExits(proxies) {
     "出口里有链式代理无法转发的节点，已停止生成，避免这些节点看起来可用。\n" +
       shown +
       more +
-      "\n请把这些节点移出出口来源，或改用 SS、SSR、VMess、Trojan、无 REALITY 的 VLESS、HTTP、SOCKS5、Snell。" +
-      "\nHysteria、Hysteria2、TUIC、WireGuard、REALITY、ShadowTLS、AnyTLS 以及其他 UDP 或专有隧道协议不能作为被入口转发的出口。" +
-      "\n允许的协议也只保证 TCP；经过入口后的 UDP（例如部分语音通话）没有保证。"
+      "\n这些节点带有「落地-」，但不能被入口转发。SS、SSR、VMess、Trojan、无 REALITY 的 VLESS、HTTP、SOCKS5、Snell 可以。" +
+      "\nHysteria、Hysteria2、TUIC、WireGuard、REALITY、ShadowTLS、AnyTLS 以及其他 UDP 或专有隧道协议不可以。" +
+      "\n可以用的协议也只保证 TCP；经过入口后的 UDP（例如部分语音）没有保证。不要为了这条错误去改组合订阅。"
   );
 }
 

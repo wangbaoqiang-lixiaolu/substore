@@ -54,11 +54,11 @@ def run_js(source, expression):
     return json.loads(result.stdout.decode() or "null")
 
 
-def build(template, entrance, exit_nodes):
-    payload = json.dumps({"template": template, "entrance": entrance, "exit": exit_nodes}, ensure_ascii=False)
+def build(template, proxies):
+    payload = json.dumps({"template": template, "proxies": proxies}, ensure_ascii=False)
     expression = (
         "(function(){ const input=JSON.parse(require('fs').readFileSync(0,'utf8'));"
-        " return ctx.buildChainConfig(input.template, input.entrance, input.exit); })()"
+        " return ctx.buildChainConfig(input.template, input.proxies); })()"
     )
     return run_js(payload, expression)
 
@@ -81,41 +81,65 @@ class ChainConfigTest(unittest.TestCase):
     def setUpClass(cls):
         cls.template = yaml.safe_load(TEMPLATE.read_text())
 
+    def collection(self):
+        return [
+            node("落地-甲", "192.0.2.10", 2001, type="vmess", udp=True),
+            node("落地-甲", "192.0.2.11", 2002, type="vmess"),
+            node("🇺🇸 落地-乙", "192.0.2.12", 2003, type="vmess"),
+            node("🇺🇸落地-丙 [IPv6]", "192.0.2.13", 2004, type="vmess"),
+            node("花云-入口", "192.0.2.1", 1001, type="ss"),
+            node("🇭🇰 花云-落地-不是出口", "192.0.2.2", 1002, type="trojan"),
+            node("自建-入口", "192.0.2.3", 1003, type="vmess"),
+            node("🇯🇵守候网络-入口 [IPv6]", "192.0.2.4", 1004, type="ss"),
+        ]
+
     def test_repeat_application_is_stable(self):
-        entrance = [node("东京", "192.0.2.1", 1001), node("东京", "192.0.2.2", 1002), node("入口·大阪", "192.0.2.3", 1003)]
-        exits = [node("洛杉矶", "192.0.2.10", 2001), node("出口·洛杉矶", "192.0.2.11", 2002, **{"dialer-proxy": "别处"})]
-        first = build(self.template, entrance, exits)
-        second = build(self.template, entrance, exits)
+        proxies = self.collection()
+        first = build(self.template, proxies)
+        second = build(self.template, proxies)
         self.assertEqual(first, second)
-        again = build(
-            first,
-            [item for item in first["proxies"] if item["name"].startswith("入口·")],
-            [item for item in first["proxies"] if item["name"].startswith("出口·")],
+        again = build(first, first["proxies"])
+        self.assertEqual([item["name"] for item in first["proxies"]], [item["name"] for item in again["proxies"]])
+        self.assertEqual(
+            [item.get("dialer-proxy") for item in first["proxies"]],
+            [item.get("dialer-proxy") for item in again["proxies"]],
         )
-        self.assertEqual(first, again)
+        exit_names = [item["name"] for item in first["proxies"] if item["name"].startswith("出口·")]
+        self.assertEqual(exit_names[0], "出口·落地-甲")
+        self.assertEqual(exit_names[1], "出口·落地-甲 #2")
 
     def test_membership_dialer_and_defaults(self):
-        config = build(
-            self.template,
-            [node("入口甲", "192.0.2.1", 1001), node("入口乙", "192.0.2.2", 1002)],
-            [node("出口甲", "192.0.2.10", 2001, udp=True), node("出口乙", "192.0.2.11", 2002)],
-        )
+        config = build(self.template, self.collection())
         reloaded = yaml.safe_load(yaml.safe_dump(config, allow_unicode=True, sort_keys=False))
         self.assertEqual(reloaded["dns"]["ipv6"], False)
         self.assertEqual(reloaded["dns"]["respect-rules"], False)
         names = [item["name"] for item in reloaded["proxies"]]
-        self.assertEqual(names, ["入口·入口甲", "入口·入口乙", "出口·出口甲", "出口·出口乙"])
+        self.assertEqual(
+            names,
+            [
+                "入口·花云-入口",
+                "入口·🇭🇰 花云-落地-不是出口",
+                "入口·自建-入口",
+                "入口·🇯🇵守候网络-入口 [IPv6]",
+                "出口·落地-甲",
+                "出口·落地-甲 #2",
+                "出口·🇺🇸 落地-乙",
+                "出口·🇺🇸落地-丙 [IPv6]",
+            ],
+        )
         groups = {item["name"]: item for item in reloaded["proxy-groups"]}
-        self.assertEqual(groups["入口选择"]["proxies"], ["入口·入口甲", "入口·入口乙"])
-        self.assertEqual(groups["出口选择"]["proxies"], ["出口·出口甲", "出口·出口乙"])
+        self.assertEqual(groups["入口选择"]["proxies"], names[:4])
+        self.assertEqual(groups["出口选择"]["proxies"], names[4:])
         self.assertEqual(groups["入口选择"]["empty-fallback"], "REJECT")
         self.assertEqual(groups["出口选择"]["empty-fallback"], "REJECT")
         self.assertNotIn("include-all", groups["入口选择"])
         self.assertNotIn("dialer-proxy", groups["出口选择"])
         by_name = {item["name"]: item for item in reloaded["proxies"]}
-        self.assertNotIn("dialer-proxy", by_name["入口·入口甲"])
-        self.assertEqual(by_name["出口·出口甲"]["dialer-proxy"], "入口选择")
-        self.assertTrue(by_name["出口·出口甲"]["udp"])
+        self.assertNotIn("dialer-proxy", by_name["入口·花云-入口"])
+        self.assertNotIn("dialer-proxy", by_name["入口·🇭🇰 花云-落地-不是出口"])
+        self.assertEqual(by_name["出口·落地-甲"]["dialer-proxy"], "入口选择")
+        self.assertEqual(by_name["出口·🇺🇸 落地-乙"]["type"], "vmess")
+        self.assertTrue(by_name["出口·落地-甲"]["udp"])
         for name in ("默认代理", "AI 服务", "消息与社交", "流媒体与音乐", "游戏", "开发与 GitHub", "微软服务", "苹果服务", "谷歌服务"):
             self.assertEqual(groups[name]["type"], "select")
             self.assertEqual(groups[name]["proxies"][0], "出口选择")
@@ -130,14 +154,41 @@ class ChainConfigTest(unittest.TestCase):
 
     def test_missing_empty_duplicate_and_blocked_exit(self):
         with self.assertRaises(RuntimeError) as empty:
-            build(self.template, [], [node("出口", "192.0.2.10", 2001)])
-        self.assertIn("入口没有节点", str(empty.exception))
+            build(self.template, [])
+        self.assertIn("没有节点", str(empty.exception))
+
+        with self.assertRaises(RuntimeError) as no_exit:
+            build(self.template, [node("花云-只有入口", "192.0.2.1", 1001, type="ss")])
+        self.assertIn("落地-", str(no_exit.exception))
+
+        with self.assertRaises(RuntimeError) as no_entrance:
+            build(self.template, [node("落地-只有出口", "192.0.2.10", 2001, type="vmess")])
+        self.assertIn("入口", str(no_entrance.exception))
+
+        with self.assertRaises(RuntimeError) as unknown:
+            build(
+                self.template,
+                [
+                    node("花云-入口", "192.0.2.1", 1001, type="ss"),
+                    node("落地-出口", "192.0.2.10", 2001, type="vmess"),
+                    node("美国节点", "192.0.2.3", 1003, type="ss"),
+                    node("落地节点", "192.0.2.4", 1004, type="vmess"),
+                    node("🇺🇸🇯🇵 落地-两个国旗", "192.0.2.11", 2002, type="vmess"),
+                ],
+            )
+        message = str(unknown.exception)
+        self.assertIn("美国节点", message)
+        self.assertIn("落地节点", message)
+        self.assertIn("两个国旗", message)
+        self.assertNotIn("192.0.2.3", message)
 
         with self.assertRaises(RuntimeError) as shared:
             build(
                 self.template,
-                [node("甲", "192.0.2.8", 443)],
-                [node("乙", "192.0.2.8", 443)],
+                [
+                    node("花云-甲", "192.0.2.8", 443, type="ss"),
+                    node("落地-乙", "192.0.2.8", 443, type="vmess"),
+                ],
             )
         self.assertNotIn("192.0.2.8", str(shared.exception))
         self.assertIn("同一个服务器和端口", str(shared.exception))
@@ -145,18 +196,17 @@ class ChainConfigTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as blocked:
             build(
                 self.template,
-                [node("入口", "192.0.2.1", 1001, type="hysteria2")],
                 [
-                    node("坏出口", "192.0.2.10", 2001, type="hysteria2", password="mock-password"),
-                    node("现实", "192.0.2.11", 2002, type="vless", **{"reality-opts": {"public-key": "mock"}}),
+                    node("花云-入口", "192.0.2.1", 1001, type="hysteria2"),
+                    node("落地-坏出口", "192.0.2.10", 2001, type="hysteria2", password="mock-password"),
+                    node("落地-现实", "192.0.2.11", 2002, type="vless", **{"reality-opts": {"public-key": "mock"}}),
                 ],
             )
-        message = str(blocked.exception)
-        self.assertIn("坏出口", message)
-        self.assertIn("Hysteria2", message)
-        self.assertIn("REALITY", message)
-        self.assertNotIn("mock-password", message)
-        self.assertNotIn("mock", message.split("REALITY")[0][-20:])
+        blocked_message = str(blocked.exception)
+        self.assertIn("落地-坏出口", blocked_message)
+        self.assertIn("Hysteria2", blocked_message)
+        self.assertIn("REALITY", blocked_message)
+        self.assertNotIn("mock-password", blocked_message)
 
     def test_main_uses_named_sources_and_keeps_the_whole_config(self):
         payload = json.dumps({"template": self.template}, ensure_ascii=False)
@@ -166,8 +216,12 @@ class ChainConfigTest(unittest.TestCase):
   const calls = [];
   ctx.produceArtifact = async function(query){
     calls.push(query);
-    if (query.name === '入口') return [{name:'甲', type:'ss', server:'192.0.2.1', port:1, cipher:'aes-128-gcm', password:'mock-password', _subName:'secret-source'}];
-    if (query.name === '出口') return [{name:'乙', type:'trojan', server:'192.0.2.2', port:2, password:'mock-password'}];
+    if (query.name === '合并' && query.type === 'collection') {
+      return [
+        {name:'花云-甲', type:'ss', server:'192.0.2.1', port:1, cipher:'aes-128-gcm', password:'mock-password', _subName:'secret-source'},
+        {name:'落地-乙', type:'vmess', server:'192.0.2.2', port:2, uuid:'mock-uuid'}
+      ];
+    }
     throw new Error('没有名为 ' + query.name + ' 的订阅');
   };
   const config = await ctx.main(input.template);
@@ -177,8 +231,9 @@ class ChainConfigTest(unittest.TestCase):
         result = run_js(payload, expression)
         self.assertEqual(result["calls"][0]["platform"], "mihomo")
         self.assertEqual(result["calls"][0]["produceType"], "internal")
-        self.assertEqual(result["calls"][0]["type"], "subscription")
-        self.assertEqual([item["name"] for item in result["calls"]], ["入口", "出口"])
+        self.assertEqual(result["calls"][0]["type"], "collection")
+        self.assertEqual(result["calls"][0]["name"], "合并")
+        self.assertEqual(len(result["calls"]), 1)
         self.assertIn("dns", result["keys"])
         self.assertIn("rules", result["keys"])
         self.assertIn("proxy-groups", result["keys"])
@@ -191,8 +246,8 @@ class ChainConfigTest(unittest.TestCase):
                 "(async function(){ const input=JSON.parse(require('fs').readFileSync(0,'utf8'));"
                 " ctx.produceArtifact=async () => { throw new Error('找不到'); }; return ctx.main(input.template); })()",
             )
-        self.assertIn("读不到入口", str(missing.exception))
-        self.assertIn("collection", str(missing.exception))
+        self.assertIn("读不到组合订阅", str(missing.exception))
+        self.assertIn("合并", str(missing.exception))
 
     def test_public_rule_urls_match_declared_behavior(self):
         providers = self.template["rule-providers"]
@@ -218,8 +273,19 @@ class ChainConfigTest(unittest.TestCase):
             self.skipTest("mihomo binary is not available")
         config = build(
             self.template,
-            [node("入口", "192.0.2.1", 1001)],
-            [node("出口", "192.0.2.10", 2001)],
+            [
+                node("花云-入口", "192.0.2.1", 1001, type="ss"),
+                node("自建-入口", "192.0.2.2", 1002, type="trojan"),
+                node(
+                    "落地-出口",
+                    "192.0.2.10",
+                    2001,
+                    type="vmess",
+                    uuid="00000000-0000-4000-8000-000000000000",
+                    alterId=0,
+                    cipher="auto",
+                ),
+            ],
         )
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "chain.yaml"
@@ -232,7 +298,9 @@ class ChainConfigTest(unittest.TestCase):
                 timeout=180,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("192.0.2.10:2001", result.stdout + result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertNotIn("192.0.2.10:2001", combined)
+        self.assertIn("test is successful", combined)
 
     def assert_acyclic(self, config):
         groups = {item["name"]: item for item in config["proxy-groups"]}

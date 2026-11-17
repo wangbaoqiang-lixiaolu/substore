@@ -1,6 +1,6 @@
 # Clash Party 与 FlClash 共用的 Mihomo 配置模板。
-# 节点不写在这里。chain-mihomo.js 会按脚本顶部的两个来源填入节点。
-# 请阅读 chain-mihomo-指南.md。不要改策略组名称。
+# 节点不写在这里。chain-mihomo.js 会读取组合订阅「合并」，
+# 按已有的「落地-」前缀填入口和出口。请阅读 chain-mihomo-指南.md。不要改策略组名称。
 
 mode: rule
 ipv6: false
