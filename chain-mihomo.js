@@ -65,8 +65,9 @@ var BLOCKED_EXIT_TYPE = {
   zerotier: "ZeroTier 不能作为被入口转发的出口",
 };
 
-var CHAIN_DEFAULT_GROUPS = [
-  GROUP.main,
+var CHAIN_DEFAULT_GROUPS = [GROUP.main];
+
+var SERVICE_GROUPS = [
   GROUP.ai,
   GROUP.social,
   GROUP.media,
@@ -100,8 +101,10 @@ function buildChainConfig(config, proxies) {
   const exitReady = tagSide(split.exit, CHAIN.exitMark, used, CHAIN.entranceGroup);
 
   next.proxies = entranceReady.concat(exitReady);
+  const exitNames = exitReady.map(item => item.name);
   fillMembers(groups, CHAIN.entranceGroup, entranceReady.map(item => item.name));
-  fillMembers(groups, CHAIN.exitGroup, exitReady.map(item => item.name));
+  fillMembers(groups, CHAIN.exitGroup, exitNames);
+  fillServiceGroups(groups, exitNames);
   assertReferences(next);
   return next;
 }
@@ -121,6 +124,8 @@ async function main(config) {
       name: spec.name,
       platform: "mihomo",
       produceType: "internal",
+      // 与普通 mihomo 输出一样丢掉空值和内部字段，不改 cipher、password、udp、plugin。
+      produceOpts: { "delete-underscore-fields": true },
     });
   } catch (error) {
     const reason = error && error.message ? error.message : String(error);
@@ -203,7 +208,10 @@ function normalizeProxy(proxy, index) {
   }
   const copy = {};
   Object.keys(proxy).forEach(key => {
-    if (key.charAt(0) !== "_") copy[key] = proxy[key];
+    if (key.charAt(0) === "_") return;
+    // 只丢掉空值。false、0 和空字符串都保留，避免改掉 SS 的开关。
+    if (proxy[key] == null) return;
+    copy[key] = proxy[key];
   });
   copy.name = stripMark(String(copy.name));
   delete copy["dialer-proxy"];
@@ -283,7 +291,6 @@ function assertPolicyShape(groups) {
     if (first !== CHAIN.exitGroup) {
       throw new Error("「" + name + "」的第一项必须是「" + CHAIN.exitGroup + "」，避免默认直连或自动换节点。");
     }
-    assertManualMembers(byName[name], byName);
   });
   const finalFirst = byName[GROUP.final].proxies && byName[GROUP.final].proxies[0];
   if (finalFirst !== GROUP.main) {
@@ -405,6 +412,34 @@ function uniqueName(base, used) {
   return name;
 }
 
+function fillServiceGroups(groups, exitNames) {
+  const directOptions = [CHAIN.entranceGroup, CHAIN.exitGroup, "DIRECT"];
+  SERVICE_GROUPS.forEach(name => {
+    const group = groups.find(item => item && item.name === name);
+    if (!group) throw new Error("模板缺少策略组「" + name + "」。");
+    group.type = "select";
+    group.proxies = exitNames.concat(directOptions);
+    group["empty-fallback"] = "REJECT";
+    delete group["include-all"];
+    delete group.filter;
+    delete group["exclude-filter"];
+    delete group["dialer-proxy"];
+    delete group.use;
+  });
+  const finance = groups.find(item => item && item.name === GROUP.finance);
+  if (!finance) throw new Error("模板缺少策略组「" + GROUP.finance + "」。");
+  finance.type = "select";
+  finance.proxies = ["DIRECT"].concat(exitNames, [CHAIN.entranceGroup, CHAIN.exitGroup]);
+  finance["empty-fallback"] = "REJECT";
+  delete finance["include-all"];
+  delete finance.filter;
+  delete finance["exclude-filter"];
+  delete finance["dialer-proxy"];
+  delete finance.use;
+  const main = groups.find(item => item && item.name === GROUP.main);
+  main.proxies = [CHAIN.exitGroup].concat(exitNames, [CHAIN.entranceGroup, "DIRECT"]);
+}
+
 function fillMembers(groups, groupName, members) {
   const group = groups.find(item => item && item.name === groupName);
   if (!group) throw new Error("模板缺少策略组「" + groupName + "」。");
@@ -486,8 +521,17 @@ function assertReferences(config) {
   });
   (config["rule-providers"] ? Object.keys(config["rule-providers"]) : []).forEach(name => {
     const provider = config["rule-providers"][name];
-    if (!provider || !provider.url || !provider.behavior || !provider.format) {
-      throw new Error("规则集「" + name + "」缺少 url、behavior 或 format。");
+    if (!provider || !provider.behavior) {
+      throw new Error("规则集「" + name + "」缺少 behavior。");
+    }
+    if (provider.type === "inline") {
+      if (!Array.isArray(provider.payload) || provider.payload.length === 0) {
+        throw new Error("规则集「" + name + "」是空的。");
+      }
+      return;
+    }
+    if (!provider.url || !provider.format) {
+      throw new Error("规则集「" + name + "」缺少 url 或 format。");
     }
   });
 }

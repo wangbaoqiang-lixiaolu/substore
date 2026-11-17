@@ -27,7 +27,6 @@ RULE_SAMPLE = {
         "games",
         "github",
         "microsoft",
-        "bank-cn",
         "finance",
         "crypto",
         "downloads",
@@ -143,12 +142,20 @@ class ChainConfigTest(unittest.TestCase):
         self.assertEqual(by_name["出口·落地-甲"]["dialer-proxy"], "入口选择")
         self.assertEqual(by_name["出口·🇺🇸 落地-乙"]["type"], "vmess")
         self.assertTrue(by_name["出口·落地-甲"]["udp"])
-        for name in ("默认代理", "AI 服务", "消息与社交", "流媒体与音乐", "游戏", "开发与 GitHub", "微软服务", "苹果服务", "谷歌服务"):
+        exit_names = names[4:]
+        self.assertEqual(groups["默认代理"]["proxies"][0], "出口选择")
+        self.assertEqual(groups["默认代理"]["proxies"][1:1 + len(exit_names)], exit_names)
+        service_tail = ["入口选择", "出口选择", "DIRECT"]
+        for name in ("AI 服务", "消息与社交", "流媒体与音乐", "游戏", "开发与 GitHub", "微软服务", "苹果服务", "谷歌服务"):
             self.assertEqual(groups[name]["type"], "select")
-            self.assertEqual(groups[name]["proxies"][0], "出口选择")
-            self.assertNotIn("DIRECT", groups[name]["proxies"][:1])
+            self.assertEqual(groups[name]["proxies"], exit_names + service_tail)
+            self.assertNotEqual(groups[name]["proxies"][0], "出口选择")
+        self.assertEqual(groups["AI 服务"]["proxies"], groups["消息与社交"]["proxies"])
+        self.assertIsNot(groups["AI 服务"]["proxies"], groups["消息与社交"]["proxies"])
         self.assertEqual(groups["漏网之鱼"]["proxies"][0], "默认代理")
-        self.assertEqual(groups["金融服务"]["proxies"][0], "DIRECT")
+        self.assertEqual(groups["金融服务"]["proxies"], ["DIRECT"] + exit_names + ["入口选择", "出口选择"])
+        proxy_name_list = [item["name"] for item in reloaded["proxies"]]
+        self.assertEqual(len(proxy_name_list), len(set(proxy_name_list)))
         self.assertEqual(groups["广告拦截"]["proxies"][0], "REJECT")
         self.assertEqual(groups["国内与局域网"]["proxies"][0], "DIRECT")
         self.assertTrue(all(item["type"] == "select" for item in reloaded["proxy-groups"]))
@@ -260,6 +267,46 @@ class ChainConfigTest(unittest.TestCase):
             self.assertIn(bad, str(rejected.exception))
             self.assertNotIn("192.0.2.30", str(rejected.exception))
 
+    def test_entrance_ss_fields_are_not_rewritten(self):
+        config = build(
+            self.template,
+            [
+                node(
+                    "花云-ss",
+                    "192.0.2.41",
+                    1401,
+                    type="ss",
+                    cipher="chacha20-ietf-poly1305",
+                    password="mock-password",
+                    udp=True,
+                    **{
+                        "skip-cert-verify": False,
+                        "plugin": "obfs",
+                        "plugin-opts": {"mode": "http", "host": "example.test"},
+                        "dialer-proxy": "旧拨号",
+                        "underlying-proxy": "旧前置",
+                        "_subName": "secret-source",
+                        "network": None,
+                    },
+                ),
+                node("落地-出口", "192.0.2.42", 1402, type="vmess"),
+            ],
+        )
+        huayun = next(item for item in config["proxies"] if item["name"].startswith("入口·"))
+        self.assertEqual(huayun["type"], "ss")
+        self.assertEqual(huayun["cipher"], "chacha20-ietf-poly1305")
+        self.assertEqual(huayun["password"], "mock-password")
+        self.assertIs(huayun["udp"], True)
+        self.assertIs(huayun["skip-cert-verify"], False)
+        self.assertEqual(huayun["plugin"], "obfs")
+        self.assertEqual(huayun["plugin-opts"]["host"], "example.test")
+        self.assertNotIn("dialer-proxy", huayun)
+        self.assertNotIn("underlying-proxy", huayun)
+        self.assertNotIn("_subName", huayun)
+        self.assertNotIn("network", huayun)
+        self.assertEqual(huayun["server"], "192.0.2.41")
+        self.assertEqual(huayun["port"], 1401)
+
     def test_main_uses_named_sources_and_keeps_the_whole_config(self):
         payload = json.dumps({"template": self.template}, ensure_ascii=False)
         expression = r"""
@@ -283,6 +330,7 @@ class ChainConfigTest(unittest.TestCase):
         result = run_js(payload, expression)
         self.assertEqual(result["calls"][0]["platform"], "mihomo")
         self.assertEqual(result["calls"][0]["produceType"], "internal")
+        self.assertEqual(result["calls"][0]["produceOpts"]["delete-underscore-fields"], True)
         self.assertEqual(result["calls"][0]["type"], "collection")
         self.assertEqual(result["calls"][0]["name"], "合并")
         self.assertEqual(len(result["calls"]), 1)
@@ -318,7 +366,14 @@ class ChainConfigTest(unittest.TestCase):
                     self.assertTrue(sample.startswith("DOMAIN") or sample.startswith("PROCESS-NAME"), sample)
                 else:
                     self.assertIn("/", sample)
-        self.assertEqual(seen, set(providers))
+        self.assertEqual(seen | {"bank-cn"}, set(providers))
+        bank = providers["bank-cn"]
+        self.assertEqual(bank["type"], "inline")
+        self.assertEqual(bank["behavior"], "classical")
+        self.assertGreaterEqual(len(bank["payload"]), 50)
+        self.assertTrue(all(str(item).startswith("DOMAIN-SUFFIX,") for item in bank["payload"]))
+        self.assertIn("DOMAIN-SUFFIX,abchina.com", bank["payload"])
+        self.assertNotIn("url", bank)
 
     def test_mihomo_parses_generated_config(self):
         if not MIHOMO.is_file() or not os.access(MIHOMO, os.X_OK):
